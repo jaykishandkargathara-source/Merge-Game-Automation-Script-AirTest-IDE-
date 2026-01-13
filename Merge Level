@@ -1,0 +1,346 @@
+# -*- encoding=utf8 -*-
+__author__ = "jk"
+
+from airtest.core.api import *
+from poco.drivers.unity3d import UnityPoco
+
+# ----------------- Setup -----------------
+auto_setup(__file__)
+connect_device("Android:///")
+poco = UnityPoco()
+
+print("=== Universal Merge-Serve Bot Start ===")
+
+# ----------------- Config -----------------
+# Item name groups per category
+pizza_items = [
+    "Bag Of Flour",
+    "Flour Dough",
+    "Garlic Bread",
+    "Slice Of Pizza",
+    "Half Pizza",
+    "Full Pizza",
+    "Square Pizza",
+    "Penne Pasta",
+    "Lasagna",
+    "Spaghetti",
+]
+
+sushi_items = [
+    "Rice Ball",
+    "Nori Rice Ball",
+    "Sushi",
+    "Stuffed Sushi",
+    "Tamago Sushi",
+    "Tuna Sushi",
+    "Salmon Sushi",
+    "Maki Sushi",
+    "Ikura Sushi",
+]
+
+dessert_items = [
+    "Chocolate",
+    "Candy",
+    "Muffin",
+    "Oreo Cookie",
+    "Cookies",
+    "Donut",
+    "Croissant",
+    "Swiss Roll",
+    "Choco Pie",
+    "Slice of Cake",
+    "Chocolate Cake",
+]
+
+# For generation / merges
+TAPS_PER_SOURCE = 8                # taps per generation round
+MAX_GENERATION_ROUNDS = 10         # how many times we can re-generate if not ready
+MAX_MERGE_STEPS_PER_ROUND = 50     # safety cap for merges per generation round
+
+# Level completion text: adjust per level if you want auto-stop.
+# If left empty, the bot will not auto-stop by itself.
+LEVEL_COMPLETE_TEXTS = [
+    # Example format you used previously:
+    # "Level  1\r\nComplete!",
+    # "Level  2\r\nComplete!",
+    # "Level  5\r\nComplete!",
+]
+
+# ----------------- Generic checks -----------------
+def check_level_complete():
+    """
+    Check for any known 'Level Complete' text.
+    Return True if found and interacted with, else False.
+
+    NOTE:
+      - Fill LEVEL_COMPLETE_TEXTS with the exact texts you see in Poco.
+      - If list is empty, this will always return False.
+    """
+    if not LEVEL_COMPLETE_TEXTS:
+        return False
+
+    sleep(1)
+    for txt in LEVEL_COMPLETE_TEXTS:
+        if poco(text=txt).exists():
+            print("Level Complete Screen appeared:", repr(txt))
+            # If your game has a generic claim/continue button, click it here.
+            if poco("Button - Claim").exists():
+                poco("Button - Claim").click()
+                print("Clicked 'Button - Claim'.")
+            elif poco(text="OK").exists():
+                poco(text="OK").click()
+                print("Clicked 'OK' on completion.")
+            # You can add other buttons as needed.
+            return True
+    return False
+
+
+def tap_taping_button_if_present():
+    """
+    Tap the 'Image - Taping Button' if present.
+    Does NOT check level completion itself.
+    Return True if it tapped, else False.
+    """
+    taping = poco("Image - Taping Button")
+    if not taping.exists():
+        return False
+
+    # Your game-specific swipe then tap
+    swipe((0.177945346, 0.161277), (0.8819221, 0.161277))
+    sleep(0.5)
+    taping[0].click()
+    print("Order Served (Taping Button).")
+    sleep(0.5)
+    return True
+
+# ----------------- Category-aware merge logic -----------------
+def try_one_merge_for_category(cat_key, maxlvl):
+    """
+    Try a single merge within ONE category (Pizza / Sushi / Dessert).
+    Returns True if a merge happened, else False.
+    Only merges items whose node names end with _<cat_key>.
+    """
+    with poco.freeze():
+        for i in range(1, maxlvl + 1):
+            simple = poco(nameMatches=fr"^Simple {i}_{cat_key}$")
+            cnt_simple = len(simple)
+
+            if cnt_simple >= 2:
+                simple[0].drag_to(simple[1], duration=0.05)
+                sleep(0.02)
+                print("Merged Simple {}_{}".format(i, cat_key))
+                return True
+
+            if cnt_simple == 1:
+                wrapped = poco(nameMatches=fr"^Wrapped {i}_{cat_key}$")
+                if len(wrapped) >= 1:
+                    simple[0].drag_to(wrapped, duration=0.05)
+                    sleep(0.02)
+                    print("Merged Simple {}_{} + Wrapped {}_{}".format(i, cat_key, i, cat_key))
+                    return True
+    return False
+
+
+def merge_for_category_until_stuck_or_ready(target_name, cat_key, maxlvl, max_steps):
+    """
+    For a given category:
+      - Repeatedly check 'Text - Heading'.
+      - If it equals target_name → return True.
+      - Else attempt category-specific merges.
+      - Stop when no more merges or step limit hits.
+
+    Returns True if heading matched target_name; False otherwise.
+    """
+    for step in range(max_steps):
+        heading_node = poco("Text - Heading")
+        if heading_node.exists():
+            current = heading_node.get_text().strip()
+            print("[Merge {} Step {}] Heading: '{}' (target: '{}')".format(cat_key, step, current, target_name))
+            if current == target_name:
+                print("Target '{}' reached in heading.".format(target_name))
+                return True
+        else:
+            print("[WARN] 'Text - Heading' not found during {} merge.".format(cat_key))
+
+        merged = try_one_merge_for_category(cat_key, maxlvl)
+        if not merged:
+            print("[INFO] No more {} merges possible in this round before reaching target.".format(cat_key))
+            return False
+
+        # Optional: after each merge, you can try to serve if tap button appears
+        if tap_taping_button_if_present() and check_level_complete():
+            # If level completes due to serving, you might want to break the whole loop in caller.
+            print("[INFO] Level seems completed after serving during merge.")
+            # We do not return True here, because "ready" refers to target_name,
+            # but we notify via prints/logs.
+
+    print("[WARN] Max merge steps ({}) for {} reached without getting '{}'.".format(max_steps, cat_key, target_name))
+    return False
+
+# ----------------- Order Serving Logic -----------------
+def process_order_node(order_node, label):
+    """
+    Handle a single order node:
+      - Click it
+      - Read item name
+      - Validate against lists
+      - Determine category & source
+      - Generate items, then category-only merges
+      - If not ready, re-generate & repeat (limited rounds)
+    """
+    if not order_node.exists():
+        print("[WARN] {}: order node not found, skipping.".format(label))
+        return False
+
+    order_node.click()
+    sleep(0.5)
+
+    info_node = poco("Text - Info Source & Food ")
+    if not info_node.exists():
+        raise AssertionError("{}: 'Text - Info Source & Food ' not found after opening order.".format(label))
+
+    item_name = info_node.get_text().strip()
+    print("{} item is: '{}'".format(label, item_name))
+
+    # Determine category & level range
+    cat_key = None
+    maxlvl = None
+    source_selector = None
+
+    if item_name in pizza_items:
+        cat_key = "Pizza"
+        maxlvl = 10
+        source_selector = "Source 4_FoodTruck"
+
+    elif item_name in sushi_items:
+        cat_key = "Sushi"
+        maxlvl = 9
+        source_selector = "Source 4_FoodTruck"
+
+    elif item_name in dessert_items:
+        cat_key = "Dessert"
+        maxlvl = 9
+        source_selector = "Source 4_BlendingEquipements"
+
+    else:
+        msg = "{}: Unexpected order '{}' (not in pizza/sushi/dessert lists). Stopping script.".format(label, item_name)
+        print("[ERROR]", msg)
+        raise AssertionError(msg)
+
+    # Close order popup
+    close_btn = poco("Image - Close")
+    if close_btn.exists():
+        close_btn.click()
+        sleep(0.5)
+    else:
+        print("[WARN] {}: Close button not found after reading order; assuming board is visible.".format(label))
+
+    # ---- Generate + Category-only Merge Loop ----
+    print("{}: Category = {}, Source = {}".format(label, cat_key, source_selector))
+
+    for gen_round in range(1, MAX_GENERATION_ROUNDS + 1):
+        print("{}: Generation round {} for '{}'".format(label, gen_round, item_name))
+
+        # Generate items from correct source
+        src = poco(source_selector).offspring("Source Item")
+        if not src.exists():
+            raise AssertionError("{}: {} -> Source Item not found!".format(label, source_selector))
+
+        pos = src.get_position()
+        for _ in range(TAPS_PER_SOURCE):
+            touch(pos)
+            sleep(0.05)
+        print("{}: Tapped {} {} times".format(label, source_selector, TAPS_PER_SOURCE))
+
+        # Now try merging ONLY this category
+        ready = merge_for_category_until_stuck_or_ready(
+            target_name=item_name,
+            cat_key=cat_key,
+            maxlvl=maxlvl,
+            max_steps=MAX_MERGE_STEPS_PER_ROUND
+        )
+
+        if ready:
+            print("{}: Dish '{}' is READY (found in Text - Heading).".format(label, item_name))
+            return True
+
+        print("{}: Not ready after generation round {}, will generate again if limit not reached.".format(
+            label, gen_round
+        ))
+
+    # If we exit loop here → even after several generations + merges, still not ready
+    msg = "{}: Could not reach target heading '{}' after {} generation rounds.".format(
+        label, item_name, MAX_GENERATION_ROUNDS
+    )
+    print("[ERROR]", msg)
+    raise AssertionError(msg)
+
+
+def serve_orders_for_first_customer():
+    """
+    For the first Normal Order View(Clone):
+      - Check for 'Normal Order Item'
+      - Check for 'Normal Order Item (1)'
+      - Process each existing order with the same logic.
+    Returns True if at least one order was processed, False if nothing to do.
+    """
+    normal_views = poco("Viewport").child("Content").child("Normal Order View(Clone)")
+    if len(normal_views) == 0:
+        print("[INFO] No Normal Order View(Clone) found. No customers to serve.")
+        return False
+
+    first_view = normal_views[0]
+    print("[INFO] Processing orders for first customer row.")
+
+    order_main = first_view.offspring("Normal Order Item")
+    order_second = first_view.offspring("Normal Order Item (1)")
+
+    processed_any = False
+
+    if order_main.exists():
+        print("[INFO] Found primary order 'Normal Order Item'.")
+        if process_order_node(order_main, "1st order"):
+            processed_any = True
+    else:
+        print("[INFO] Primary 'Normal Order Item' not found for this customer.")
+
+    if order_second.exists():
+        print("[INFO] Found secondary order 'Normal Order Item (1)'.")
+        if process_order_node(order_second, "2nd order"):
+            processed_any = True
+    else:
+        print("[INFO] No 'Normal Order Item (1)' (second order) for this customer.")
+
+    return processed_any
+
+# ----------------- Main Loop -----------------
+while True:
+    # 1) If a taping button is visible, serve immediately.
+    if tap_taping_button_if_present() and check_level_complete():
+        # If level complete after serving, break out.
+        break
+
+    # 2) Fallback direct level check (if you configured LEVEL_COMPLETE_TEXTS)
+    if check_level_complete():
+        break
+
+    # 3) Serve orders (1 or 2) for first customer
+    try:
+        served_any = serve_orders_for_first_customer()
+    except AssertionError as e:
+        print("[FATAL]", e)
+        break
+
+    if not served_any:
+        print("[INFO] No orders processed this loop. Waiting a bit...")
+        sleep(1)
+        continue
+
+    # 4) After orders are ready, try to serve again
+    if tap_taping_button_if_present() and check_level_complete():
+        break
+
+    # Small delay to avoid hammering CPU/UI
+    sleep(0.2)
+
+print("=== Universal Merge-Serve Bot Finished ===")
