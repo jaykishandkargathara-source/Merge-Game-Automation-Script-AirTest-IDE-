@@ -1,1 +1,1 @@
-# Merge-Game-Automation-Script-AirTest-IDE-
+# Merge-Game-Automation-Script-AirTest-IDE
